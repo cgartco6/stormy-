@@ -1,0 +1,7 @@
+flask
+openai
+python-dotenv
+requests
+pyyaml
+gTTS   # Google TTS fallback (online, simple)
+termux-api-python   # pip install termux-api (unofficial wrapper, or use subprocess)
