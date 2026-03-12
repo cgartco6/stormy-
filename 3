@@ -1,0 +1,199 @@
+#!/bin/bash
+set -e
+echo "🚀 Upgrading Stormy — LIVE NAV VOICE + Pi AUTO-BOOT (Cape Town ready 🔥)"
+
+PROJECT_DIR="Stormy"
+cd "$PROJECT_DIR"  # assumes you're in parent dir; adjust if needed
+
+# Update requirements (add piper for better Pi TTS + gpsd client)
+cat << 'EOL' > requirements.txt
+flask
+openai
+python-dotenv
+pyttsx3
+SpeechRecognition
+pyaudio
+requests
+pyyaml
+gps3  # modern gpsd client (pip install gps3)
+piper-tts  # optional: better local TTS
+EOL
+
+# Upgrade install_linux.sh for Pi nav/boot
+cat << 'EOL' > install_linux.sh
+#!/bin/bash
+sudo apt-get update
+sudo apt-get install -y portaudio19-dev python3-pyaudio gpsd gpsd-clients python3-gps git
+pip install -r requirements.txt
+# Optional: Piper TTS (natural voice, Pi-optimized)
+pip install piper-tts
+echo "Stormy upgraded!"
+echo "GPS setup: sudo systemctl enable gpsd && sudo systemctl start gpsd"
+echo "For auto-boot: see auto-start instructions in README or run sudo ./setup_autostart.sh"
+EOL
+chmod +x install_linux.sh
+
+# New: systemd service setup script
+cat << 'EOL' > setup_autostart.sh
+#!/bin/bash
+SERVICE_FILE="/etc/systemd/system/stormy.service"
+
+sudo bash -c "cat > $SERVICE_FILE" << EOF
+[Unit]
+Description=Stormy AI - Cocky Voice Assistant
+After=network.target gpsd.service sound.target
+
+[Service]
+ExecStart=/usr/bin/python3 -u /home/$(whoami)/Stormy/stormy/cli/main.py --voice --nav-mode
+WorkingDirectory=/home/$(whoami)/Stormy
+StandardOutput=append:/home/$(whoami)/stormy.log
+StandardError=append:/home/$(whoami)/stormy.log
+Restart=always
+User=$(whoami)
+Environment=XAI_API_KEY=your_key_here_from_.env
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable stormy.service
+sudo systemctl start stormy.service
+
+echo "Stormy set to auto-start on boot!"
+echo "Check status: sudo systemctl status stormy"
+echo "Logs: tail -f \~/stormy.log"
+echo "To disable: sudo systemctl disable stormy"
+EOL
+chmod +x setup_autostart.sh
+
+# New navigation module
+cat << 'EOL' > stormy/core/navigation.py
+import time
+from gps3.agps3threaded import AGPS3mechanism
+from .tools import get_directions
+from .utils import get_current_location  # fallback
+import threading
+
+class NavigationEngine:
+    def __init__(self, speak_callback, personality):
+        self.speak = speak_callback
+        self.personality = personality
+        self.destination = None
+        self.annoyance = 0
+        self.agps_thread = AGPS3mechanism()
+        self.agps_thread.stream_data()
+        self.agps_thread.run_thread()
+
+    def set_destination(self, dest_coords):  # e.g. (lat, lon) or address → resolve via Nominatim if needed
+        self.destination = dest_coords
+        self.annoyance = 0
+        self.speak("Alright hot stuff, setting course. Don't fuck this up.")
+
+    def monitor(self):
+        while self.destination:
+            try:
+                lat = self.agps_thread.data_stream.lat if self.agps_thread.data_stream.lat != 'n/a' else get_current_location()['lat']
+                lon = self.agps_thread.data_stream.lon if self.agps_thread.data_stream.lon != 'n/a' else get_current_location()['lon']
+            except:
+                lat, lon = get_current_location()['lat'], get_current_location()['lon']
+
+            instructions = get_directions(lat, lon, self.destination)
+            if not instructions:
+                self.speak("Lost signal, you muffin. Pull over before I lose my shit.")
+                time.sleep(10)
+                continue
+
+            next_turn = instructions[0] if instructions else "Keep going straight, genius."
+            self.speak(f"Next: {next_turn}. Don't ignore me this time, handsome.")
+
+            # Simulate approach (real would use distance to next maneuver)
+            time.sleep(30)  # in real: calculate based on speed/distance
+
+            # If user ignores (simulated or via voice feedback later)
+            self.annoyance += 1
+            if self.annoyance > 2:
+                self.speak("You missed it AGAIN? Listen here you dumbass, turn the fuck around NOW!")
+            elif self.annoyance > 1:
+                self.speak("Really? That was your turn. Pay attention or I'm done helping.")
+
+            time.sleep(5)
+EOL
+
+# Upgrade TTS for better Pi voice (piper optional)
+cat << 'EOL' > stormy/voice/text_to_speech.py
+try:
+    from piper.voice import PiperVoice
+    voice = PiperVoice.load("en_US-lessac-medium")  # download model first or use default
+    def speak(text):
+        print("Stormy:", text)
+        with open("output.wav", "wb") as f:
+            voice.synthesize(text, f)
+        # Play with aplay or pygame on Pi
+        import os
+        os.system("aplay output.wav")
+except ImportError:
+    import pyttsx3
+    engine = pyttsx3.init()
+    engine.setProperty('rate', 150)
+    def speak(text):
+        print("Stormy:", text)
+        engine.say(text)
+        engine.runAndWait()
+EOL
+
+# Upgrade CLI for nav mode
+cat << 'EOL' > stormy/cli/main.py
+import sys
+from stormy.core import AIEngine, Memory, NavigationEngine
+from stormy.voice import listen, speak
+from stormy.core.personality import load_personality
+
+def main():
+    engine = AIEngine()
+    mem = Memory()
+    p = load_personality()
+
+    nav_engine = None
+    if "--nav" in sys.argv or "--nav-mode" in sys.argv:
+        nav_engine = NavigationEngine(speak, p)
+        dest = " ".join([arg for arg in sys.argv if arg not in ["--voice", "--nav", "--nav-mode"]]) or "Cape Town Waterfront"
+        # In real: geocode dest to (lat,lon) via Nominatim
+        nav_engine.set_destination((-33.906, 18.420))  # example Waterfront
+        threading.Thread(target=nav_engine.monitor, daemon=True).start()
+
+    print("Stormy online 🔥 (Cape Town vibe) — talk or drive")
+    while True:
+        user_input = listen() if "--voice" in sys.argv else input("You: ")
+        if user_input.lower() in ["exit","bye","quit"]: break
+        if "navigate to" in user_input.lower():
+            dest = user_input.split("to")[-1].strip()
+            print(f"Nav to: {dest}")
+            # Trigger nav_engine.set_destination(...)
+            speak(f"Got it, heading to {dest}. Try not to get us lost, big guy.")
+            continue
+
+        reply = engine.get_response(user_input, mem.get_history())
+        print("Stormy:", reply)
+        speak(reply)
+        mem.add("user", user_input)
+        mem.add("assistant", reply)
+
+if __name__ == "__main__":
+    main()
+EOL
+
+# Update personality.yaml guidelines (append these lines)
+echo "
+  - "In navigation mode, announce upcoming turns flirtily/meanly: 'In 200m, turn left you sexy disaster.'"
+  - "If user misses turn multiple times, escalate to full rage while staying verbal."
+  - "If user sounds stressed/angry in car, interject calming: 'Whoa there killer, breathe... Stormy’s got your back in this shit traffic.'" >> config/personality.yaml
+
+echo "✅ Upgrade complete!"
+echo "Next steps:"
+echo "1. ./install_linux.sh"
+echo "2. For live GPS: plug USB GPS → sudo gpsd /dev/ttyACM0 -F /var/run/gpsd.sock (adjust device)"
+echo "3. Test nav: python -m stormy.cli.main --voice --nav \"Table Mountain\""
+echo "4. Auto-boot: sudo ./setup_autostart.sh  (edit ExecStart if needed)"
+echo "5. Piper TTS (better voice): pip install piper-tts && download model from https://github.com/rhasspy/piper"
+echo "Stormy now talks directions while roasting you in traffic. Drive safe, hot stuff... or don't. 😈"
